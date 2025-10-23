@@ -5,6 +5,10 @@ var data = {};
 // Used for comparing what changed since last update
 var oldData = {};
 
+// Global variable that tracks the max delta index that has been applied.
+// Used as a failsafe to prevent stale state-changes from being processed.
+var maxAppliedDeltaIdx = -1;
+
 // Global variable containing settings red from settings.json
 // The settings under /layout/settings.json (global) are merged with /layout/<directory>/settings.json (local),
 // where the local settings have priority over global ones
@@ -31,7 +35,7 @@ async function UpdateWrapper(event) {
     window.requestAnimationFrame(() => {
       $(document).waitForImages(() => {
         $("body").fadeTo(1, 1, () => {
-          console.log("Start()")
+          console.log("Start()");
           Start();
         });
       });
@@ -47,8 +51,8 @@ async function UpdateData() {
     oldData = data;
     data = await getData();
 
-    if(data.timestamp <= oldData.timestamp){
-      return
+    if (data.timestamp <= oldData.timestamp) {
+      return;
     }
 
     let event = new CustomEvent("tsh_update");
@@ -72,30 +76,33 @@ async function UpdateData_SocketIO() {
     // Connect to Socket.io. Valid: websocket, webtransport, polling
     // Python threading with Qt is weird so put in polling method if
     // really absolutely necessary.
-    const socket = io(window.location.protocol + '//' + window.location.host + '/', {
-      transports: ['websocket', 'webtransport'],
-      timeout: 500,
-      reconnectionDelay: 500,
-      reconnectionDelayMax: 1500
+    const socket = io(
+      window.location.protocol + "//" + window.location.host + "/",
+      {
+        transports: ["websocket", "webtransport"],
+        timeout: 500,
+        reconnectionDelay: 500,
+        reconnectionDelayMax: 1500,
+      }
+    );
+
+    socket.on("connect", () => {
+      console.log("socket.io connected");
     });
 
-    socket.on('connect', () => {
-      console.log('socket.io connected');
-    });
-
-    socket.on('disconnect', () => {
+    socket.on("disconnect", () => {
       // call program_state.json initially in case it's a
       // websocket issue and not with web server being gone
       // e.g. TSH being closed
-      console.log('socket.io disconnected');
+      console.log("socket.io disconnected");
       UpdateData();
     });
 
-    socket.io.on('reconnect', () => {
-      console.log('socket.io reconnected');
+    socket.io.on("reconnect", () => {
+      console.log("socket.io reconnected");
     });
 
-    socket.io.on('reconnect_attempt', (attempt_number) => {
+    socket.io.on("reconnect_attempt", (attempt_number) => {
       // every 1-2 seconds, it will attempt to reconnect to
       // the websocket. before that happens, call UpdateData
       // in case it's an issue with the websocket and not
@@ -103,7 +110,7 @@ async function UpdateData_SocketIO() {
       UpdateData();
     });
 
-    socket.io.on('reconnect_failed', () => {
+    socket.io.on("reconnect_failed", () => {
       // reconnect_failed, if max retries are reached,
       // will fall back to file loading program_state.json
       setInterval(async () => {
@@ -111,13 +118,17 @@ async function UpdateData_SocketIO() {
       }, 64);
     });
 
-    socket.on('error', (err) => {
+    socket.on("error", (err) => {
       console.log(err);
     });
 
-    socket.on('program_state', (newData) => {
+    socket.on("program_state", (message) => {
       oldData = data;
-      data = newData;
+      data = message["state"];
+
+      // Fine to reset the max applied index here, since we know that we've
+      // received a complete valid state for a point in time.
+      maxAppliedDeltaIdx = message["delta_index"];
 
       let event = new CustomEvent("tsh_update");
       event.data = data;
@@ -126,7 +137,17 @@ async function UpdateData_SocketIO() {
       console.log(data);
       document.dispatchEvent(event);
     });
-  } catch(e) {
+
+    socket.on("program_state_update", (message) => {
+      try {
+        console.log("Handling state delta: ", message);
+        HandleTSHStateUpdateMessage(message);
+      } catch (e) {
+        // We failed to handle the program state, so request a new update.
+        socket.emit("program_state", {});
+      }
+    });
+  } catch (e) {
     console.log(e);
   }
 }
@@ -150,13 +171,13 @@ async function LoadEverything() {
 
   let urlParams = new URLSearchParams(window.location.search);
   window.scoreboardNumber = 1;
-  
+
   /*
     Read URL params (<url>?var=val&var2=val2...)
     Options:
       scoreboardNumber
   */
-  for(let [k, v] of urlParams.entries()){
+  for (let [k, v] of urlParams.entries()) {
     window[k] = v;
   }
 
@@ -193,7 +214,10 @@ async function InitAll() {
 
   await LoadKuroshiro();
 
-  if(window.location.protocol === 'file:' || window.location.host === 'absolute') {
+  if (
+    window.location.protocol === "file:" ||
+    window.location.host === "absolute"
+  ) {
     setInterval(async () => {
       await UpdateData();
     }, 64);
@@ -205,13 +229,13 @@ async function InitAll() {
 
   // await UpdateData();
 
-  $(document).ready(()=>{
+  $(document).ready(() => {
     console.log("== Init complete ==");
     document.dispatchEvent(new CustomEvent("tsh_init"));
-  
+
     document.addEventListener("tsh_update", UpdateWrapper);
     gsap.globalTimeline.timeScale(0);
-  })
+  });
 }
 
 // Read program_state.json
@@ -250,8 +274,11 @@ async function LoadSettings() {
     console.log(e);
   }
 
-  tsh_settings = _.defaultsDeep(file_settings, global_settings);
-  console.log(tsh_settings);
+  tsh_settings = _.defaultsDeep(
+    window.settings,
+    file_settings,
+    global_settings
+  );
 }
 
 // Registers element for content fitting inside div if the div is resized
@@ -304,7 +331,7 @@ async function Transcript(text) {
     enabled: true,
     to: "romaji",
     mode: "normal",
-    romajiSystem: "nippon",
+    romajiSystem: "hepburn",
   });
 
   if (text == null || text.length == 0 || !settings.enabled) return text;
@@ -340,8 +367,19 @@ async function SetInnerHtml(element, html, settings = {}) {
   if (force === false) return;
 
   // Fade out/in animations
-  let anim_in = { autoAlpha: 1, duration: fadeTime, stagger: 0.1, ...settings.anim_in };
-  let anim_out = { autoAlpha: 0, duration: fadeTime, stagger: 0.1, overwrite: true, ...settings.anim_out };
+  let anim_in = {
+    autoAlpha: 1,
+    duration: fadeTime,
+    stagger: 0.1,
+    ...settings.anim_in,
+  };
+  let anim_out = {
+    autoAlpha: 0,
+    duration: fadeTime,
+    stagger: 0.1,
+    overwrite: true,
+    ...settings.anim_out,
+  };
 
   if (html == null || html === undefined) html = "";
 
@@ -360,7 +398,9 @@ async function SetInnerHtml(element, html, settings = {}) {
   await document.fonts.ready;
 
   // Decode the HTML content to compare
-  const currentText = he.decode(String(element.find(".text").html()).replace(/'/g, '"'));
+  const currentText = he.decode(
+    String(element.find(".text").html()).replace(/'/g, '"')
+  );
   const newText = he.decode(String(html).replace(/'/g, '"'));
 
   if (force === true || currentText !== newText) {
@@ -390,15 +430,14 @@ async function SetInnerHtml(element, html, settings = {}) {
     };
 
     if (!firstRun) {
-      anim_out.onComplete = ()=>updateElement(element, html, firstRun)
+      anim_out.onComplete = () => updateElement(element, html, firstRun);
       await gsap.to(element.find(".text"), anim_out);
     } else {
-      anim_out.onComplete = ()=>updateElement(element, html, firstRun)
+      anim_out.onComplete = () => updateElement(element, html, firstRun);
       await gsap.set(element.find(".text"), anim_out);
     }
   }
 }
-
 
 const degrees_to_radians = (deg) => (deg * Math.PI) / 180.0;
 
@@ -440,35 +479,6 @@ function GenerateMulticharacterPositions(
   }
 
   return positions;
-}
-
-// Use a HTML canvas to resize an image
-// Only needed when downscaling images, to avoid bad image quality
-function resizeInCanvas(image, width, height) {
-  // Only resize if image is being downscaled
-  if (width >= image.width || height >= image.height) {
-    return image.src;
-  }
-
-  // Initialize the canvas and it's size
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
-
-  // Set width and height
-  canvas.width = width;
-  canvas.height = height;
-
-  ctx.imageSmoothingQuality = "medium";
-  ctx.imageSmoothingEnabled = true;
-
-  // Draw image and export to a data-uri
-  ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-  const dataURI = canvas.toDataURL("image/webp");
-
-  canvas.remove();
-
-  // Do something with the result, like overwrite original
-  return dataURI;
 }
 
 // Detect div size changes for character images
@@ -596,26 +606,36 @@ async function CenterImageDo(element) {
               };
             }
 
-            if (!customElement) customElement = element;
+            let containerWidth = 0;
+            let containerHeight = 0;
+
+            if (!customElement) {
+              // customElement = $(element).get(0);
+              let referenceElement = element.parent();
+              containerWidth = $(referenceElement).innerWidth();
+              containerHeight = $(referenceElement).innerHeight();
+            } else {
+              containerWidth = $(customElement).innerWidth();
+              containerHeight = $(customElement).innerHeight();
+            }
 
             let proportional_zoom = 1;
             if (assetData.average_size) {
               proportional_zoom = 0;
               proportional_zoom = Math.max(
                 proportional_zoom,
-                ($(customElement).innerWidth() / assetData.average_size.x) * 1.2
+                (containerWidth / assetData.average_size.x) * 1.2
               );
               proportional_zoom = Math.max(
                 proportional_zoom,
-                ($(customElement).innerHeight() / assetData.average_size.y) *
-                  1.2
+                (containerHeight / assetData.average_size.y) * 1.2
               );
             }
 
             // For cropped assets, zoom to fill
             // Calculate max zoom
-            zoom_x = $(customElement).innerWidth() / img.naturalWidth;
-            zoom_y = $(customElement).innerHeight() / img.naturalHeight;
+            zoom_x = containerWidth / img.naturalWidth;
+            zoom_y = containerHeight / img.naturalHeight;
 
             let minZoom = 1;
 
@@ -674,13 +694,12 @@ async function CenterImageDo(element) {
             let yy = 0;
 
             if (!customCenter) {
-              xx = -eyesight.x * zoom + $(element).innerWidth() / 2;
+              xx = -eyesight.x * zoom + containerWidth / 2;
             } else {
-              xx =
-                -eyesight.x * zoom + $(element).innerWidth() * customCenter[0];
+              xx = -eyesight.x * zoom + containerWidth * customCenter[0];
             }
 
-            let maxMoveX = $(element).innerWidth() - img.naturalWidth * zoom;
+            let maxMoveX = containerWidth - img.naturalWidth * zoom;
 
             if (!uncropped_edge || !uncropped_edge.includes("l")) {
               if (xx > 0) xx = 0;
@@ -690,13 +709,12 @@ async function CenterImageDo(element) {
             }
 
             if (!customCenter) {
-              yy = -eyesight.y * zoom + $(element).innerHeight() / 2;
+              yy = -eyesight.y * zoom + containerHeight / 2;
             } else {
-              yy =
-                -eyesight.y * zoom + $(element).innerHeight() * customCenter[1];
+              yy = -eyesight.y * zoom + containerHeight * customCenter[1];
             }
 
-            let maxMoveY = $(element).innerHeight() - img.naturalHeight * zoom;
+            let maxMoveY = containerHeight - img.naturalHeight * zoom;
 
             if (!uncropped_edge || !uncropped_edge.includes("u")) {
               if (yy > 0) yy = 0;
@@ -715,32 +733,16 @@ async function CenterImageDo(element) {
               $(element).parent().css("z-index", 0);
             }
 
-            $(element)
-              .css({
-                "background-position": `
-              ${xx}px
-              ${yy}px
-            `,
-                "background-size": `
-              ${img.naturalWidth * zoom}px
-              ${img.naturalHeight * zoom}px
-            `,
-                "background-repeat": "no-repeat",
-                "background-image":
-                  "url(" +
-                  resizeInCanvas(
-                    img,
-                    img.naturalWidth * zoom,
-                    img.naturalHeight * zoom
-                  ) +
-                  ")",
-              })
-              .promise();
+            $(element).attr("src", img.src);
 
-            //element.css("background-position", "initial");
-            //element.css("position", "fixed");
-            //element.css("width", img.naturalWidth * zoom);
-            //element.css("height", img.naturalHeight * zoom);
+            $(element).css({
+              left: `${xx}px`,
+              top: `${yy}px`,
+              "overflow-clip-margin": "unset", // makes downscaling not pixelated
+              width: `${img.naturalWidth * zoom}px`,
+              height: `${img.naturalHeight * zoom}px`,
+            });
+
             resolve();
           };
         });
@@ -788,18 +790,86 @@ function nextPow2(v) {
  * Stores content to be added to the DOM with SetInnerHtml later
  */
 class ContentResolver {
-  constructor () {
-      this.list = [];
+  constructor() {
+    this.list = [];
   }
 
-  add(selector, value){
-      this.list.push({s: selector, v: value});
-      return ""
+  add(selector, value) {
+    this.list.push({ s: selector, v: value });
+    return "";
   }
 
-  resolve(){
-      for (let element of this.list){
-          SetInnerHtml($(element.s), element.v);
-      }
+  resolve() {
+    for (let element of this.list) {
+      SetInnerHtml($(element.s), element.v);
+    }
   }
+}
+
+function HandleTSHStateUpdateMessage(message) {
+  const deltaIdx = message["delta_index"];
+  const deltas = message["delta"];
+
+  if (deltaIdx < maxAppliedDeltaIdx) {
+    throw Error(
+      `Received out of order delta ${deltaIdx} (applied: ${maxAppliedDeltaIdx}`
+    );
+  }
+
+  let event = new CustomEvent("tsh_update");
+  // Ancient jutsu to deep-clone an object. We will be modifying
+  event.oldData = JSON.parse(JSON.stringify(data));
+
+  applyDeltas(data, deltas);
+  event.data = data;
+  maxAppliedDeltaIdx = Math.max(deltaIdx, maxAppliedDeltaIdx);
+  console.log(data);
+
+  // it's fine if this doesn't fire because we threw an exception earlier, because
+  // that means state wasn't applied and we've requested new program state.
+  document.dispatchEvent(event);
+}
+
+/**
+ * Takes a single delta operation, and modifies the data object.
+ *
+ * @param {Object} data
+ * @param {Delta} delta
+ */
+function applyDelta(data, delta) {
+  const pathPieces = delta.path;
+  /** @type {DeltaOpType} */ const deltaOp = delta.action;
+  const newValue = delta.value;
+  const lastPiece = pathPieces[pathPieces.length - 1];
+
+  let currentData = data;
+  for (let i = 0; i < pathPieces.length - 1; i += 1) {
+    if (!currentData.hasOwnProperty(pathPieces[i])) {
+      currentData[pathPieces[i]] = {};
+    }
+
+    currentData = currentData[pathPieces[i]];
+  }
+
+  if (deltaOp === "dictionary_item_removed") {
+    if (currentData.hasOwnProperty(lastPiece)) {
+      delete currentData[lastPiece];
+    } else {
+      console.warn(`Couldn't find data to delete for path: ${pathPieces}`);
+    }
+  } else {
+    currentData[lastPiece] = newValue;
+  }
+}
+
+/**
+ * @param {Object} data
+ * @param {Delta[]} deltas python deep-diff delta object.
+ */
+function applyDeltas(data, deltas) {
+  for (let delta of deltas) {
+    applyDelta(data, delta);
+  }
+
+  return data;
 }
